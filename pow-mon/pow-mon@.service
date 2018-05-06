@@ -1,0 +1,10 @@
+[Unit]
+Description=RaspberryPi Power Monitor service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pow-mon %i
+
+[Install]
+WantedBy=multi-user.target
