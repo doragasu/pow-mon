@@ -63,7 +63,12 @@ typedef struct {
 	int32_t p3;
 } command;
 
-static void parse_command(command *cmd) {
+static int stat = STAT_LISTEN;
+// Server socket
+static int ss;
+
+static void parse_command(command *cmd)
+{
 	FILE *f;
 
 	// Only commands implemented so far are READ and WRITE
@@ -117,13 +122,15 @@ static void parse_command(command *cmd) {
 }
 
 static void timeval_add_us(const struct timeval *in, suseconds_t usec,
-		struct timeval *out) {
+		struct timeval *out)
+{
 	usec += in->tv_usec;
 	out->tv_usec = usec % 1000000;
 	out->tv_sec = in->tv_sec + usec / 1000000;
 }
 
-static int timeval_compare(const struct timeval *in1, const struct timeval *in2) {
+static int timeval_compare(const struct timeval *in1, const struct timeval *in2)
+{
 	if (in1->tv_sec > in2->tv_sec) return TV_IN1_GREATER;
 	else if (in1->tv_sec < in2->tv_sec) return TV_IN2_GREATER;
 	// Seconds are equal, compare usecs
@@ -132,28 +139,122 @@ static int timeval_compare(const struct timeval *in1, const struct timeval *in2)
 	return TV_EQUAL;
 }
 
-void Usage(void) {
+static void Usage(void)
+{
 	printf("Usage:\n\n");
 	printf("pow-mon [server-port]\n\n");
 	printf("Starts power monitor on specified server port. If port is "
 		   "omitted, default port " STR(DEF_SERV_PORT) " is used.\n");
 }
 
-int main(int argc, char **argv) {
+static void button_proc(int fd) {
+	static struct timeval last = {0, 0};
+	struct timeval current, limit;
 	char val;
+	FILE *f;
+
+	lseek(fd, 0, SEEK_SET);
+	read(fd, &val, 1);
+	// Events accepted only if predefined time has passed
+//			printf("val = %c\n", val);
+	gettimeofday(&current, NULL);
+	timeval_add_us(&last, MIN_DELTA_US, &limit);
+	if (timeval_compare(&current, &limit) >= 0) {
+		// Required time elapsed, toggle power status
+		if (rpg_read(HW_GPIO_PON)) {
+			rpg_clear(HW_GPIO_PON);
+			if ((f = popen(SCRIPT_POWERDOWN, "r")))
+					pclose(f);
+			else fprintf(stderr, "popen failed\n");
+#ifdef __DEBUG
+			puts("POWER OFF");
+#endif
+		} else {
+			rpg_set(HW_GPIO_PON);
+#ifdef __DEBUG
+			puts("POWER ON");
+#endif
+			if ((f = popen(SCRIPT_POWERUP, "r")))
+					pclose(f);
+			else fprintf(stderr, "popen failed\n");
+		}
+
+	}
+	last = current;
+}
+
+static void socket_proc(struct pollfd *pfd) {
+	// Client socket
+	int s;
+	command cmd;
+
+	switch (stat) {
+	case STAT_LISTEN:
+		if ((s = SckAccept(ss)) > 0) {
+			// Accepted, set Keepalive to avoid socket being
+			// opened while inactive for a long time
+			SckSetKeepalive(s, SOCK_KA_IDLE_TIME,
+					SOCK_KA_RETR_INTERVAL, SOCK_KA_RETRIES);
+			pfd[1].fd = s;
+			stat = STAT_CONNECT;
+#ifdef __DEBUG
+			puts("Connected");
+#endif
+		} else {
+			perror("accept failed");
+		}
+		break;
+
+	case STAT_CONNECT:
+		if (recv(pfd[1].fd, &cmd, sizeof(cmd), 0) !=  sizeof(cmd)) {
+#ifdef __DEBUG
+			puts("connection closed py peer");
+#endif
+			close(pfd[1].fd);
+			pfd[1].fd = ss;
+			stat = STAT_LISTEN;
+		} else {
+			parse_command(&cmd);
+#ifdef __DEBUG
+			puts("SEND PAYLOAD");
+#endif
+			if (send(pfd[1].fd, &cmd, sizeof(cmd), 0) !=
+					sizeof(cmd)) {
+				fprintf(stderr, "send failed\n");
+				close(pfd[1].fd);
+				pfd[1].fd = ss;
+				stat = STAT_LISTEN;
+			}
+		}
+
+		break;
+	}
+}
+
+static int event_proc(struct pollfd *pfd, int n_desc) {
+	int ret;
+
+	ret = poll(pfd, 2, -1);
+	if (ret <= 0) {
+		perror("poll failed");
+		close(pfd[0].fd);
+		return 1;
+	} else if (pfd[0].revents & POLLPRI) {
+		button_proc(pfd[0].fd);
+	} else if (pfd[1].revents & POLLIN) {
+		socket_proc(pfd);
+	} else {
+		perror("poll failed");
+	}
+
+	return 0;
+}
+
+int main(int argc, char **argv) {
+	char dummy;
 	rpg_retval retval;
 	// File descriptor for GPIO pin, and socket
 	struct pollfd pfd[2];
-	int ret;
-	// Server socket
-	int ss;
-	// Client socket
-	int s;
-	int stat = STAT_LISTEN;
-	command cmd;
-	static struct timeval last = {0, 0};
-	struct timeval current, limit;
-	FILE *f;
 	long port = DEF_SERV_PORT;
 
 	// argc can be 1 (no parameters) or 2 (server port)
@@ -203,88 +304,10 @@ int main(int argc, char **argv) {
 	pfd[1].fd = ss;
 	pfd[1].events = POLLIN;
 	// Read to clear pending interrupts
-	read(pfd[0].fd, &val, 1);
+	read(pfd[0].fd, &dummy, 1);
 	printf("RPGPIO ready to accept commands on port %ld!\n", port);
 	while (1) {
-		ret = poll(pfd, 2, -1);
-		if (ret <= 0) {
-			perror("poll failed");
-			close(pfd[0].fd);
-			return 1;
-		} else if (pfd[0].revents & POLLPRI) {
-			lseek(pfd[0].fd, 0, SEEK_SET);
-			read(pfd[0].fd, &val, 1);
-			// Events accepted only if predefined time has passed
-//			printf("val = %c\n", val);
-			gettimeofday(&current, NULL);
-			timeval_add_us(&last, MIN_DELTA_US, &limit);
-			if (timeval_compare(&current, &limit) >= 0) {
-				// Required time elapsed, toggle power status
-				if (rpg_read(HW_GPIO_PON)) {
-					rpg_clear(HW_GPIO_PON);
-					if ((f = popen(SCRIPT_POWERDOWN, "r")))
-							pclose(f);
-					else fprintf(stderr, "popen failed\n");
-#ifdef __DEBUG
-					puts("POWER OFF");
-#endif
-				} else {
-					rpg_set(HW_GPIO_PON);
-#ifdef __DEBUG
-					puts("POWER ON");
-#endif
-					if ((f = popen(SCRIPT_POWERUP, "r")))
-							pclose(f);
-					else fprintf(stderr, "popen failed\n");
-				}
-
-			}
-			last = current;
-		} else if (pfd[1].revents & POLLIN) {
-			switch (stat) {
-				case STAT_LISTEN:
-					if ((s = SckAccept(ss)) > 0) {
-						// Accepted, set Keepalive to avoid socket being
-						// opened while inactive for a long time
-						SckSetKeepalive(s, SOCK_KA_IDLE_TIME,
-								SOCK_KA_RETR_INTERVAL, SOCK_KA_RETRIES);
-						pfd[1].fd = s;
-						stat = STAT_CONNECT;
-#ifdef __DEBUG
-								puts("Connected");
-#endif
-					} else {
-						perror("accept failed");
-					}
-					break;
-
-				case STAT_CONNECT:
-					if (recv(pfd[1].fd, &cmd, sizeof(cmd), 0) !=  sizeof(cmd)) {
-#ifdef __DEBUG
-						puts("connection closed py peer");
-#endif
-						close(pfd[1].fd);
-						pfd[1].fd = ss;
-						stat = STAT_LISTEN;
-					} else {
-						parse_command(&cmd);
-#ifdef __DEBUG
-						puts("SEND PAYLOAD");
-#endif
-						if (send(pfd[1].fd, &cmd, sizeof(cmd), 0) !=
-								sizeof(cmd)) {
-							fprintf(stderr, "send failed\n");
-							close(pfd[1].fd);
-							pfd[1].fd = ss;
-							stat = STAT_LISTEN;
-						}
-					}
-
-					break;
-			}
-		} else {
-			perror("poll failed");
-		}
+		event_proc(pfd, 2);
 	}
 
 	close(pfd[0].fd);
