@@ -7,6 +7,8 @@
 #include <arpa/inet.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <pthread.h>
+#include <stdbool.h>
 
 #include "rpgpio.h"
 #include "sock.h"
@@ -47,11 +49,6 @@
 #define TV_IN2_GREATER			-1
 
 enum {
-	STAT_LISTEN,
-	STAT_CONNECT,
-};
-
-enum {
 	CMD_READ  = 3,
 	CMD_WRITE = 4,
 };
@@ -62,10 +59,6 @@ typedef struct {
 	int32_t p2;
 	int32_t p3;
 } command;
-
-static int stat = STAT_LISTEN;
-// Server socket
-static int ss;
 
 static void parse_command(command *cmd)
 {
@@ -147,7 +140,76 @@ static void Usage(void)
 		   "omitted, default port " STR(DEF_SERV_PORT) " is used.\n");
 }
 
-static void button_proc(int fd) {
+static bool parse_client_command(int s)
+{
+	command cmd;
+
+	if (sizeof(cmd) != recv(s, &cmd, sizeof(cmd), 0)) {
+#ifdef __DEBUG
+		puts("connection closed py peer");
+#endif
+		return true;
+	}
+	parse_command(&cmd);
+#ifdef __DEBUG
+	puts("SEND PAYLOAD");
+#endif
+	if (sizeof(cmd) != send(s, &cmd, sizeof(cmd), 0)) {
+		fprintf(stderr, "send failed\n");
+		return true;
+	}
+
+	return false;
+}
+
+static void *client_thread(void *arg)
+{
+	int s = (int)arg;
+	bool err = false;
+
+	while (!err) {
+		err = parse_client_command(s);
+	}
+
+	close(s);
+	pthread_exit(NULL);
+}
+
+bool client_thread_start(int client_socket)
+{
+	int ret;
+	pthread_t tid;
+	pthread_attr_t attr;
+
+	// Set Keepalive to avoid socket being opened while inactive for a long time
+	SckSetKeepalive(client_socket, SOCK_KA_IDLE_TIME,
+			SOCK_KA_RETR_INTERVAL, SOCK_KA_RETRIES);
+	// Thread attributes initialization
+	if ((ret = pthread_attr_init(&attr)) != 0) {
+		fprintf(stderr, "attr_init: %s", strerror(errno));
+		return true;
+	}
+	// Set thread as detached
+	if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
+		fprintf(stderr, "attr_setdetachstate error");
+		return true;
+	}
+	// Create thread
+	if ((ret = pthread_create(&tid, &attr, &client_thread,
+					(void*)client_socket)) != 0) {
+		fprintf(stderr, "pthread_create error");
+		return true;
+	}
+	// Free thread attributes
+	if ((ret = pthread_attr_destroy(&attr)) != 0) {
+		fprintf(stderr, "attr_destroy error");
+		return true;
+	}
+	return false;
+}
+
+static void button_proc(int fd)
+{
 	static struct timeval last = {0, 0};
 	struct timeval current, limit;
 	char val;
@@ -183,55 +245,23 @@ static void button_proc(int fd) {
 	last = current;
 }
 
-static void socket_proc(struct pollfd *pfd) {
+static void socket_proc(int ss)
+{
 	// Client socket
 	int s;
-	command cmd;
 
-	switch (stat) {
-	case STAT_LISTEN:
-		if ((s = SckAccept(ss)) > 0) {
-			// Accepted, set Keepalive to avoid socket being
-			// opened while inactive for a long time
-			SckSetKeepalive(s, SOCK_KA_IDLE_TIME,
-					SOCK_KA_RETR_INTERVAL, SOCK_KA_RETRIES);
-			pfd[1].fd = s;
-			stat = STAT_CONNECT;
+	if ((s = SckAccept(ss)) > 0) {
 #ifdef __DEBUG
-			puts("Connected");
+		puts("Connected");
 #endif
-		} else {
-			perror("accept failed");
-		}
-		break;
-
-	case STAT_CONNECT:
-		if (recv(pfd[1].fd, &cmd, sizeof(cmd), 0) !=  sizeof(cmd)) {
-#ifdef __DEBUG
-			puts("connection closed py peer");
-#endif
-			close(pfd[1].fd);
-			pfd[1].fd = ss;
-			stat = STAT_LISTEN;
-		} else {
-			parse_command(&cmd);
-#ifdef __DEBUG
-			puts("SEND PAYLOAD");
-#endif
-			if (send(pfd[1].fd, &cmd, sizeof(cmd), 0) !=
-					sizeof(cmd)) {
-				fprintf(stderr, "send failed\n");
-				close(pfd[1].fd);
-				pfd[1].fd = ss;
-				stat = STAT_LISTEN;
-			}
-		}
-
-		break;
+		client_thread_start(s);
+	} else {
+		perror("accept failed");
 	}
 }
 
-static int event_proc(struct pollfd *pfd, int n_desc) {
+static int event_proc(struct pollfd *pfd, int n_desc)
+{
 	int ret;
 
 	ret = poll(pfd, 2, -1);
@@ -240,9 +270,11 @@ static int event_proc(struct pollfd *pfd, int n_desc) {
 		close(pfd[0].fd);
 		return 1;
 	} else if (pfd[0].revents & POLLPRI) {
+		// Button press
 		button_proc(pfd[0].fd);
 	} else if (pfd[1].revents & POLLIN) {
-		socket_proc(pfd);
+		// Incoming connection
+		socket_proc(pfd[1].fd);
 	} else {
 		perror("poll failed");
 	}
@@ -250,12 +282,15 @@ static int event_proc(struct pollfd *pfd, int n_desc) {
 	return 0;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
 	char dummy;
 	rpg_retval retval;
 	// File descriptor for GPIO pin, and socket
-	struct pollfd pfd[2];
+	struct pollfd pfd[2] = {0};
 	long port = DEF_SERV_PORT;
+	int val_true = 1;
+	int ss = -1;
 
 	// argc can be 1 (no parameters) or 2 (server port)
 	if (argc > 2) {
@@ -272,8 +307,6 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 	}
-
-	memset(pfd, 0, sizeof(pfd));
 
 	if ((retval = rpg_init()) < 0) {
 		rpg_perror(retval, "rpgpio initialization");
@@ -296,6 +329,7 @@ int main(int argc, char **argv) {
 		perror("server socket creation failed");
 		return 1;
 	}
+	setsockopt(ss, SOL_SOCKET, SO_REUSEADDR, &val_true, sizeof(val_true));
 	if (SckBind(ss, INADDR_ANY, port) != ss) {
 		perror("socket bind failed");
 		return 1;

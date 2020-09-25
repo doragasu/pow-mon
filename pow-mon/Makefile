@@ -1,9 +1,9 @@
 TARGET=pow-mon
 SRCS=$(wildcard *.c)
 CC?=gcc
-#CFLAGS=-O2 -Wall -march=armv7-a -mfloat-abi=hard -mfpu=vfpv3-d16 -O2 -pipe -fstack-protector-strong -fno-plt -ffunction-sections -I/opt/vc/include -D__DEBUG
-CFLAGS=-O2 -Wall -march=armv7-a -mfloat-abi=hard -mfpu=vfpv3-d16 -O2 -pipe -fstack-protector-strong -fno-plt -ffunction-sections -I/opt/vc/include
-LIBS=-L/opt/vc/lib -lbcm_host -Wl,-gc-sections
+CFLAGS=-O2 -Wall -march=armv7-a -mfloat-abi=hard -mfpu=vfpv3-d16 -O2 -pipe -fstack-protector-strong -fno-plt -ffunction-sections -I/opt/vc/include -D__DEBUG
+#CFLAGS=-O2 -Wall -march=armv7-a -mfloat-abi=hard -mfpu=vfpv3-d16 -O2 -pipe -fstack-protector-strong -fno-plt -ffunction-sections -I/opt/vc/include -pthread
+LIBS=-L/opt/vc/lib -lbcm_host -Wl,-gc-sections -pthread
 
 OBJDIR=obj
 OBJS=$(patsubst %.c,$(OBJDIR)/%.o,$(SRCS))
