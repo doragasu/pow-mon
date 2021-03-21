@@ -1,7 +1,7 @@
 #Maintainer: doragasu <doragasu@hotmail.com>
 
 pkgname=pow-mon
-pkgver=1.0
+pkgver=1.1
 pkgrel=4
 pkgdesc="Controls secondary RPi power, providing pushbutton and socket control interfaces."
 arch=(armv7h)

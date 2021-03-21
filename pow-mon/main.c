@@ -164,7 +164,7 @@ static bool parse_client_command(int s)
 
 static void *client_thread(void *arg)
 {
-	int s = (int)arg;
+	int s = (intptr_t)arg;
 	bool err = false;
 
 	while (!err) {
@@ -196,7 +196,7 @@ bool client_thread_start(int client_socket)
 	}
 	// Create thread
 	if ((ret = pthread_create(&tid, &attr, &client_thread,
-					(void*)client_socket)) != 0) {
+					(void*)((intptr_t)client_socket))) != 0) {
 		fprintf(stderr, "pthread_create error");
 		return true;
 	}
