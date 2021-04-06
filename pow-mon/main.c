@@ -9,30 +9,36 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <gpiod.h>
 
-#include "rpgpio.h"
 #include "sock.h"
 
+/// Computes a bit mask
+#define BIT(n) (1<<(n))
+
 /// Default server port
-#define DEF_SERV_PORT			8888
+#define DEF_SERV_PORT 8888
 
 /// One minute idle time for socket KeepAlive
-#define SOCK_KA_IDLE_TIME		120
+#define SOCK_KA_IDLE_TIME 120
 
 /// Five seconds retry interval for socket Keepalive
-#define SOCK_KA_RETR_INTERVAL	5
+#define SOCK_KA_RETR_INTERVAL 5
 
 /// Nine retries before giving up socket KeepAlive
-#define SOCK_KA_RETRIES			9
+#define SOCK_KA_RETRIES 9
 
-/// Used to restrict which pins are writeable (only GPIO3 and GPIO4)
-#define WRITE_MASK				0x00000018
+/// Pin used to control power supply ON
+#define HW_GPIO_PON 3
+
+/// Pin used to control LED
+#define HW_GPIO_LED 4
+
+/// Pin used to read pushbutton
+#define HW_GPIO_BUTTON 2
 
 /// Minimum time in us to pass for pushbutton presses to be accepted
 #define MIN_DELTA_US			2000000
-
-/// Pin used to control power
-#define HW_GPIO_PON				3
 
 /// Script to run when power is turned on
 #define SCRIPT_POWERUP			"/etc/pow-mon/power-up"
@@ -60,46 +66,62 @@ typedef struct {
 	int32_t p3;
 } command;
 
-static void parse_command(command *cmd)
+static struct {
+	struct gpiod_chip *chip;
+	struct gpiod_line *power_on;
+	struct gpiod_line *power_button;
+	bool power_stat;
+} io = {};
+
+static void set_power(bool value)
 {
 	FILE *f;
 
+	gpiod_line_set_value(io.power_on, value);
+	if (value) {
+		// Run powerup script
+		if ((f = popen(SCRIPT_POWERUP, "r"))) {
+			pclose(f);
+		}
+	} else {
+		// Run powerdown script
+		if ((f = popen(SCRIPT_POWERDOWN, "r"))) {
+			pclose(f);
+		}
+	}
+#ifdef __DEBUG
+	const char * const valstr[] = {"OFF", "ON"};
+	printf("POWER %s\n", valstr[value]);
+#endif
+	io.power_stat = value;
+}
+
+static void parse_command(command *cmd)
+{
 	// Only commands implemented so far are READ and WRITE
 	switch (cmd->cmd) {
 		case CMD_READ:
-			cmd->p3 = rpg_read(cmd->p1);
+			if (HW_GPIO_BUTTON == cmd->p1) {
+				cmd->p3 = gpiod_line_get_value(io.power_button);
 #ifdef __DEBUG
-			printf("READ GPIO%d = %d\n", cmd->p1, cmd->p3);
+				printf("READ GPIO%d = %d\n", cmd->p1, cmd->p3);
 #endif
+			} else if (HW_GPIO_PON == cmd->p1) {
+				cmd->p3 = io.power_stat;
+			} else {
+				fprintf(stderr, "pin %d is not readable\n", cmd->p1);
+				cmd->p3 = -2000;
+			}
 			break;
 
 		case CMD_WRITE:
 			// Check pin is writeable
-			if ((1<<cmd->p1) & WRITE_MASK) {
-				if (cmd->p2) {
-					rpg_set(cmd->p1);
-					if (HW_GPIO_PON == cmd->p1) {
-						// Run powerup script
-						if ((f = popen(SCRIPT_POWERUP, "r")))
-								pclose(f);
-					}
-				} else {
-					if (HW_GPIO_PON == cmd->p1) {
-						// Run powerdown script
-						if ((f = popen(SCRIPT_POWERDOWN, "r")))
-								pclose(f);
-					}
-					rpg_clear(cmd->p1);
-				}
-#ifdef __DEBUG
-				printf("WRITE GPIO%d <- %d\n", cmd->p1, cmd->p2);
-#endif
-				// If written pin was HW_GPIO_PON, run script
-				if (HW_GPIO_PON == cmd->p2) {
-					if (cmd->p3) {
-					} else {
-					}
-				}
+			if (HW_GPIO_PON == cmd->p1) {
+				// Power ON/OFF depending on cmd->p2
+				set_power(cmd->p2);
+				cmd->p3 = 0;
+			} else if (HW_GPIO_LED == cmd->p2) {
+				// TODO
 				cmd->p3 = 0;
 			} else {
 				fprintf(stderr, "pin %d is not writable\n", cmd->p1);
@@ -186,61 +208,40 @@ bool client_thread_start(int client_socket)
 			SOCK_KA_RETR_INTERVAL, SOCK_KA_RETRIES);
 	// Thread attributes initialization
 	if ((ret = pthread_attr_init(&attr)) != 0) {
-		fprintf(stderr, "attr_init: %s", strerror(errno));
+		fprintf(stderr, "attr_init: %s\n", strerror(errno));
 		return true;
 	}
 	// Set thread as detached
 	if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
-		fprintf(stderr, "attr_setdetachstate error");
+		fprintf(stderr, "attr_setdetachstate error\n");
 		return true;
 	}
 	// Create thread
 	if ((ret = pthread_create(&tid, &attr, &client_thread,
 					(void*)((intptr_t)client_socket))) != 0) {
-		fprintf(stderr, "pthread_create error");
+		fprintf(stderr, "pthread_create error\n");
 		return true;
 	}
 	// Free thread attributes
 	if ((ret = pthread_attr_destroy(&attr)) != 0) {
-		fprintf(stderr, "attr_destroy error");
+		fprintf(stderr, "attr_destroy error\n");
 		return true;
 	}
 	return false;
 }
 
-static void button_proc(int fd)
+static void button_proc(const struct gpiod_line_event *ev)
 {
+	(void)ev;
 	static struct timeval last = {0, 0};
 	struct timeval current, limit;
-	char val;
-	FILE *f;
 
-	lseek(fd, 0, SEEK_SET);
-	read(fd, &val, 1);
 	// Events accepted only if predefined time has passed
-//			printf("val = %c\n", val);
 	gettimeofday(&current, NULL);
 	timeval_add_us(&last, MIN_DELTA_US, &limit);
 	if (timeval_compare(&current, &limit) >= 0) {
 		// Required time elapsed, toggle power status
-		if (rpg_read(HW_GPIO_PON)) {
-			rpg_clear(HW_GPIO_PON);
-			if ((f = popen(SCRIPT_POWERDOWN, "r")))
-					pclose(f);
-			else fprintf(stderr, "popen failed\n");
-#ifdef __DEBUG
-			puts("POWER OFF");
-#endif
-		} else {
-			rpg_set(HW_GPIO_PON);
-#ifdef __DEBUG
-			puts("POWER ON");
-#endif
-			if ((f = popen(SCRIPT_POWERUP, "r")))
-					pclose(f);
-			else fprintf(stderr, "popen failed\n");
-		}
-
+		set_power(!io.power_stat);
 	}
 	last = current;
 }
@@ -262,30 +263,89 @@ static void socket_proc(int ss)
 
 static int event_proc(struct pollfd *pfd, int n_desc)
 {
+	(void)n_desc;
 	int ret;
+	struct gpiod_line_event event;
 
 	ret = poll(pfd, 2, -1);
 	if (ret <= 0) {
 		perror("poll failed");
-		close(pfd[0].fd);
-		return 1;
-	} else if (pfd[0].revents & POLLPRI) {
-		// Button press
-		button_proc(pfd[0].fd);
+	} else if (pfd[0].revents & POLLIN) {
+		ret = gpiod_line_event_read_fd(pfd[0].fd, &event);
+		if (ret < 0) {
+			perror("event read failed");
+		} else {
+			// Button press
+			button_proc(&event);
+		}
 	} else if (pfd[1].revents & POLLIN) {
 		// Incoming connection
 		socket_proc(pfd[1].fd);
+		ret = 0;
 	} else {
 		perror("poll failed");
+		ret = -1;
 	}
 
-	return 0;
+	return ret;
+}
+
+static struct gpiod_line* output_config(int pin, int initial_value)
+{
+	struct gpiod_line *line;
+	line = gpiod_chip_get_line(io.chip, pin);
+	if (!line) {
+		perror("Getting GPIO pin");
+		goto err;
+	}
+	if (gpiod_line_request_output(line, "pow-mon_out", 0) < 0) {
+		perror("Configuring output pin");
+		goto release;
+	}
+	if (gpiod_line_set_value(line, initial_value) < 0) {
+		perror("Setting output initial value");
+		goto release;
+	}
+
+	return line;
+
+release:
+	gpiod_line_release(line);
+err:
+	return NULL;
+}
+
+static struct gpiod_line* event_config(int pin, int *fd)
+{
+	char dummy;
+	struct gpiod_line *line = gpiod_chip_get_line(io.chip, pin);
+	if (!line) {
+		perror("Getting GPIO pin");
+		goto err;
+	}
+	if (gpiod_line_request_falling_edge_events(line, "pow-mon_event") < 0) {
+		perror("Configuring notification");
+		goto release;
+	}
+
+	*fd = gpiod_line_event_get_fd(line);
+	if (*fd < 0) {
+		perror("Getting fd from input line");
+		goto release;
+	}
+	// Read to clear spurious interrupt
+	read(*fd, &dummy, 1);
+
+	return line;
+
+release:
+	gpiod_line_release(line);
+err:
+	return NULL;
 }
 
 int main(int argc, char **argv)
 {
-	char dummy;
-	rpg_retval retval;
 	// File descriptor for GPIO pin, and socket
 	struct pollfd pfd[2] = {0};
 	long port = DEF_SERV_PORT;
@@ -308,21 +368,21 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if ((retval = rpg_init()) < 0) {
-		rpg_perror(retval, "rpgpio initialization");
+	io.chip = gpiod_chip_open_by_name("gpiochip0");
+	if (!io.chip) {
+		perror("Open chip failed");
 		return 1;
 	}
-#ifdef __DEBUG
-	rpg_reg_print();
-#endif
-	retval = rpg_int_enable(2, "falling\n", &pfd[0].fd);
-	if (RPG_OK != retval) {
-		rpg_perror(retval, NULL);
-		return 1;
+
+	// TODO properly free resources
+	io.power_on = output_config(HW_GPIO_PON, 0);
+	if (!io.power_on) {
+		goto release;
 	}
-	// Configure GPIO outputs
-	rpg_configure(3, RPG_FUNC_OUTPUT);
-	rpg_configure(4, RPG_FUNC_OUTPUT);
+	io.power_button = event_config(HW_GPIO_BUTTON, &pfd[0].fd);
+	if (!io.power_button) {
+		goto release;
+	}
 
 	// Create socket and start server
 	if ((ss = SckCreate()) < 0) {
@@ -334,16 +394,18 @@ int main(int argc, char **argv)
 		perror("socket bind failed");
 		return 1;
 	}
-	pfd[0].events = POLLPRI | POLLERR;
+	pfd[0].events = POLLIN | POLLERR;
 	pfd[1].fd = ss;
 	pfd[1].events = POLLIN;
-	// Read to clear pending interrupts
-	read(pfd[0].fd, &dummy, 1);
 	printf("RPGPIO ready to accept commands on port %ld!\n", port);
 	while (1) {
 		event_proc(pfd, 2);
 	}
 
 	close(pfd[0].fd);
-	return 0;
+release:
+	if (io.power_on) gpiod_line_release(io.power_on);
+	if (io.power_button) gpiod_line_release(io.power_button);
+	gpiod_chip_close(io.chip);
+	return 1;
 }

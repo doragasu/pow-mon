@@ -1,12 +1,12 @@
 #Maintainer: doragasu <doragasu@hotmail.com>
 
 pkgname=pow-mon
-pkgver=1.1
-pkgrel=4
+pkgver=1.2
+pkgrel=1
 pkgdesc="Controls secondary RPi power, providing pushbutton and socket control interfaces."
 arch=(armv7h)
 license=(GPL)
-depends=(raspberrypi-firmware)
+depends=(libgpiod)
 source=("git+https://github.com/doragasu/${pkgname}.git")
 
 sha256sums=(SKIP)
